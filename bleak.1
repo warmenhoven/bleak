@@ -1,0 +1,20 @@
+.TH BLEAK 3 "April 23rd, 2004"
+.SH NAME
+bleak \- basic leak detector
+.SH DESCRIPTION
+bleak is a shared library that keeps a hash of all memory allocations. It removes entries from the hash when the memory is freed. If a double-free is detected, it kills the program.
+
+When print_leaks() is called, it scans /proc/self/maps, and checks every valid address searching for pointers to the allocated memory. If there are no references then the memory must have been leaked.
+
+Because of this incredibly simple heuristic, bleak is not reliable. For example, a doubly-linked list with two elements will never be detected as a leak, because all allocated memory is pointed at. Also, some pointer arithmetic can confuse bleak and make it report leaks when you still have a pointer to a portion of the memory.
+.SH USAGE
+Link your program with the bleak library. Make sure you are not linking with any other memory debugger such as efence.
+.SH ENVIRONMENT VARIABLES
+.TP
+BLEAK_ATEXIT
+If this is set then bleak will call print_leaks() for you using atexit().
+.TP
+BLEAK_SIG
+Set this to the integer value (as listed by kill -l) of the signal that will cause bleak to call print_leaks(). This defaults to SIGPROF (29). Set it to 0 to turn this off.
+.SH SEE ALSO
+.BR kill (1).

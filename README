@@ -1,0 +1,45 @@
+1. What it does
+
+   bleak is a malloc wrapper that checks for leaks. When print_leaks() is
+   called it will print out all the leaked addresses as well as a backtrace
+   showing where the memory was allocated from. bleak is thread-safe.
+
+2. How it does it
+
+   bleak keeps a table of every allocation. When print_leaks() is called, it
+   searches all possible addresses, seeing if there is a reference to that
+   location. If there is not, it marks that allocation as a leak.
+
+   It figures out what the possible addresses are by reading /proc/pid/maps.
+   This means that bleak most likely only works on Linux.
+
+   Because it is searching for an address that points to the allocated space,
+   it is affected by things like pointer logic and luck. For example, if you
+   have a pointer pointing to an allocated block, and increment the pointer to
+   write to the byte after, the pointer is no longer pointing at the allocated
+   block, and this will be considered a leak. Also if there is a place in
+   memory, say in a binary data buffer, with the same contents as the address,
+   this will be considered a pointer to the address, and so not a leak, even if
+   it only "points" there through dumb luck.
+
+3. How to compile it
+
+   There is a Makefile included that should build bleak without any problems.
+   bleak depends on pthreads, libdl, and bfd. bfd in turn depends on libiberty.
+   Some systems may not need -liberty to be pased to the linker, but shouldn't
+   complain when it is.
+
+4. How to use it
+
+   Link your program against libbleak.so. You can do this either through a
+   relink or by using the LD_PRELOAD environment variable. Then when you want
+   to check for leaks, call print_leaks(). You can do this either by modifying
+   your program or by running the program from inside gdb.
+
+5. That's it?
+
+   Yes. I wanted bleak to be very small and to only check for leaks. It's
+   targetted at an embedded linux environment where there is only a console.
+   Because it keeps track of allocations it also implicitly protects against
+   double-free's. But that wasn't the goal, and if you want to check for memory
+   abuse instead of memory disuse, use electric fence.
