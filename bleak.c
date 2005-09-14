@@ -1,6 +1,6 @@
 /*
  * bleak - leak detector
- * Copyright (C) 2003  Eric Warmenhoven
+ * Copyright (C) 2003-2005  Eric Warmenhoven
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -28,9 +28,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 pthread_mutex_t lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static int check_leaks = 0;
 
 struct mem {
 	void *addr;
@@ -55,15 +58,28 @@ static int high_water = 0;
 
 #define MAX_BT 50
 static int print_bt = 0;
-extern void print_leaks(int);
+extern void print_leaks(void);
 
 #define HASH(addr) (((unsigned int)(addr) / (sizeof (void *))) % HASH_SIZE)
+
+static void
+set_check_leaks(int x)
+{
+	fprintf(stderr, "bleak: pid %d got signal %d\n", getpid(), x);
+	check_leaks = 1;
+}
 
 static int
 bleak_init()
 {
 	static int init = 0;
+	int sig = SIGPWR;
 	char *p;
+
+	if (check_leaks) {
+		check_leaks = 0;
+		print_leaks();
+	}
 
 	if (init > 0)
 		return (1);
@@ -79,22 +95,26 @@ bleak_init()
 	 * causes malloc to return NULL.
 	 */
 	init = -1;
+
 	memset(hash, 0, sizeof (hash));
+
 	libc_malloc = dlsym(RTLD_NEXT, "__libc_malloc");
 	libc_calloc = dlsym(RTLD_NEXT, "__libc_calloc");
 	libc_realloc = dlsym(RTLD_NEXT, "__libc_realloc");
 	libc_free = dlsym(RTLD_NEXT, "__libc_free");
+
 	if (getenv("BLEAK_ATEXIT")) {
 		atexit(print_leaks);
 	}
 	if ((p = getenv("BLEAK_SIG")) != NULL) {
 		int a = atoi(p);
 		if (a != 0) {
-			signal(a, print_leaks);
+			sig = a;
 		}
-	} else {
-		signal(SIGPROF, print_leaks);
 	}
+	signal(sig, set_check_leaks);
+	fprintf(stderr, "bleak: pid %d signal %d\n", getpid(), sig);
+
 	init = 1;
 
 	return (1);
@@ -439,14 +459,14 @@ read_bfd(struct map *m)
 }
 
 static void
-print_backtrace(struct mem *mem)
+print_backtrace(FILE *outfile, struct mem *mem)
 {
 	int i;
 
-	print_bt = 1;
 	for (i = 0; i < mem->btcount; i++) {
 		const char *file, *func;
-		unsigned int line, addr;
+		unsigned int line;
+		unsigned int addr;
 		struct map *map;
 
 		addr = (unsigned int)mem->bt[i];
@@ -454,68 +474,70 @@ print_backtrace(struct mem *mem)
 		map = find_map(addr);
 
 		if (!map) {
-			printf("[0x%08x]\n", addr);
-			continue;
-		}
-
-		if (!map->abfd && !read_bfd(map)) {
-			printf("[0x%08x] %s\n", addr, map->file);
-			continue;
-		}
-
-		if (!bfd_find_nearest_line(map->abfd, map->section, map->syms,
-					   addr - map->section->vma,
-					   &file, &func, &line)) {
-			printf("[0x%08x] %s\n", addr, map->file);
-			continue;
+			fprintf(outfile, "[0x%08x]\n", addr);
+		} else if (!map->abfd && !read_bfd(map)) {
+			fprintf(outfile, "[0x%08x] %s\n", addr, map->file);
+		} else if (!bfd_find_nearest_line(map->abfd, map->section, map->syms,
+										  addr - map->section->vma, &file,
+										  &func, &line)) {
+			fprintf(outfile, "[0x%08x] %s\n", addr, map->file);
 		} else if (file) {
-			printf("[0x%08x] %s(): %s:%u\n", addr, func, file, line);
+			fprintf(outfile, "[0x%08x] %s(): %s:%u\n", addr, func, file, line);
 		} else {
-			printf("[0x%08x] %s()\n", addr, func);
+			fprintf(outfile, "[0x%08x] %s()\n", addr, func);
 		}
 	}
-	print_bt = 0;
 }
 
 void
-print_leaks(int sig)
+print_leaks()
 {
+	FILE *file;
 	int fd;
 	char buf[1024];
 	struct mem *mem;
-	int check = 0;
 	int i;
 	int numallocs = 0;
+	int leaks = 0, leaktot = 0;
 
-	pthread_mutex_lock(&lock);
+	struct timeval start_tv;
+	struct timeval done_tv;
+	int worked;
+	int worked_ms;
+
+	fprintf(stderr, "bleak: pid %d checking leaks\n", getpid());
 
 	if ((fd = open("/proc/self/maps", O_RDONLY)) < 0) {
-		fprintf(stderr, "bleak: open failed!\n");
-		pthread_mutex_unlock(&lock);
+		fprintf(stderr, "bleak: pid %d open failed!\n", getpid());
 		return;
 	}
+
+	print_bt = 1;
+
+	gettimeofday(&start_tv, NULL);
 
 	for (i = 0; i < HASH_SIZE; i++) {
 		mem = hash[i];
 		while (mem) {
-			check++;
 			mem->leaked = 1;
+			leaks++;
+			leaktot += mem->size;
 			mem = mem->next;
 		}
 	}
-	numallocs = check;
+	numallocs = leaks;
 
-	while (check && fdgets(buf, 1024, fd) > 0) {
+	while (leaks && fdgets(buf, 1024, fd) > 0) {
 		unsigned int start, end;
 		char file[256], perms[16];
 		void **ptr;
 		struct map *map;
 		sscanf(buf, "%x-%x %15s %*x %*u:%*u %*u %255s",
 		       &start, &end, perms, file);
-		if (perms[0] == '-')
+		if (perms[0] == '-' || perms[1] == '-')
 			continue;
 		make_map(start, end, file);
-		for (ptr = (void **)start; check && ptr < (void **)end; ptr++) {
+		for (ptr = (void **)start; leaks && ptr < (void **)end; ptr++) {
 			if (!(mem = hash_find(*ptr)))
 				continue;
 			if (ptr == &mem->addr)
@@ -526,10 +548,25 @@ print_leaks(int sig)
 			    (ptr == (void *)&map->start || ptr == (void *)&map->end))
 				continue;
 			mem->leaked = 0;
-			check--;
+			leaks--;
+			leaktot -= mem->size;
 		}
 	}
 	close(fd);
+
+	gettimeofday(&done_tv, NULL);
+
+	worked = done_tv.tv_sec - start_tv.tv_sec;
+	if (done_tv.tv_usec >= start_tv.tv_usec) {
+		worked_ms = (done_tv.tv_usec - start_tv.tv_usec) / 1000;
+	} else {
+		worked_ms = (done_tv.tv_usec / 1000) +
+			(1000 - (start_tv.tv_usec / 1000));
+	    worked--;
+	}
+
+	fprintf(stderr, "bleak: pid %d leak check time %d.%03d seconds\n",
+			getpid(), worked, worked_ms);
 
 	i = readlink("/proc/self/exe", buf, 1024);
 	buf[i] = 0;
@@ -537,25 +574,33 @@ print_leaks(int sig)
 	fprintf(stderr, "%d bytes allocated in %d allocs, %d bytes average\n",
 		total_size, numallocs, total_size / numallocs);
 	fprintf(stderr, "%d max bytes allocated\n", high_water);
-	if (!check) {
+	if (!leaks) {
 		fprintf(stderr, "No Leaks!\n\n");
-		pthread_mutex_unlock(&lock);
+		print_bt = 0;
 		return;
 	}
 
-	fprintf(stderr, "\nLeaks: \n");
+	fprintf(stderr, "\n%d leaks totalling %d bytes:\n", leaks, leaktot);
+	snprintf(buf, 1024, "%d.leaks", getpid());
+	file = fopen(buf, "w");
+	if (file == NULL) {
+		file = stderr;
+	} else {
+		fprintf(stderr, "dumping leak backtraces to %s\n", buf);
+	}
 	for (i = 0; i < HASH_SIZE; i++) {
 		mem = hash[i];
 		while (mem) {
 			if (mem->leaked) {
-				fprintf(stderr, " %p %d bytes\n",
-					mem->addr, mem->size);
-				print_backtrace(mem);
+				fprintf(file, " %p %d bytes\n", mem->addr, mem->size);
+				print_backtrace(file, mem);
+				leaks++;
+				leaktot += mem->size;
 			}
 			mem = mem->next;
 		}
 	}
-	printf("\n");
-
-	pthread_mutex_unlock(&lock);
+	if (file != stderr)
+		fclose(file);
+	print_bt = 0;
 }
